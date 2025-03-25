@@ -2,12 +2,12 @@ import torch
 from torch.distributions import Distribution
 
 import tqdm
-from typing import Tuple
+from typing import Tuple, List
 
 from utils.utils import load_yaml, fwd_mixture
 from guided_diffusion.unet import create_model
 from guided_diffusion.gaussian_diffusion import create_sampler
-from diffusers import DDPMPipeline
+from diffusers import DDPMPipeline, StableDiffusionXLPipeline
 from torch.func import grad
 from omegaconf import OmegaConf
 from ldm.util import instantiate_from_config
@@ -140,19 +140,6 @@ class EpsilonNet(torch.nn.Module):
 
     def differentiable_decode(self, z):
         return self.net.differentiable_decode(z)
-
-    # def value_and_grad_predx0(self, x, t):
-    #     x = x.requires_grad_()
-    #     pred_x0 = self.predict_x0(x, t)
-    #     grad_pred_x0 = torch.autograd.grad(pred_x0.sum(), x)[0]
-    #     return pred_x0, grad_pred_x0
-
-    # def value_and_jac_predx0(self, x, t):
-    #     def pred(x):
-    #         return self.predict_x0(x, t)
-
-    #     pred_x0 = self.predict_x0(x, t)
-    #     return pred_x0, vmap(jacrev(pred))(x)
 
 
 # TODO: fix shape handling
@@ -296,6 +283,17 @@ def load_epsilon_net(model_id: str, n_steps: int, device: str):
         timesteps = torch.linspace(0, 999, n_steps, dtype=torch.int32)
 
         return EpsilonNet(net, alphas_cumprod, timesteps)
+
+    if model_id == "sdxl1.0":
+        pipeline = StableDiffusionXLPipeline.from_pretrained(
+            "stabilityai/stable-diffusion-xl-base-1.0", torch_dtype=torch.float32
+        )
+        pipeline.to(device)
+
+        acp = (1.0 - pipeline.scheduler.betas).cumprod(dim=0).to(device)
+        net = SDWrapper(pipeline)
+
+        return EpsilonNet(net, acp, timesteps)
 
 
 def bridge_kernel_statistics(
@@ -541,3 +539,84 @@ class VPPrecond(torch.nn.Module):
 
     def round_sigma(self, sigma):
         return torch.as_tensor(sigma)
+
+
+class SDWrapper(torch.nn.Module):
+    def __init__(self, pipeline):
+        super().__init__()
+
+        self.pipeline = pipeline
+        self.unet, self.vae = pipeline.unet, pipeline.vae
+        self.prompt = "Pandas built with paper"
+        self.use_cfg = False
+
+        # these should be freezed as they aren't trainable
+        self.unet.requires_grad_(False)
+        self.vae.requires_grad_(False)
+
+    def forward(self, x, t):
+        prompt_embeds, uncond_prompt_embeds, *others = self.pipeline.encode_prompt(
+            prompt=self.prompt,
+            device=x.device,
+            num_images_per_prompt=x.shape[0],
+            do_classifier_free_guidance=self.use_cfg,
+        )
+        if self.use_cfg:
+            prompt_embeds = torch.cat([uncond_prompt_embeds, prompt_embeds])
+            x = torch.cat([x] * 2)
+
+        added_cond_kwargs = SDWrapper._get_cond_kwargs(others, self.use_cfg)
+        pred = self.unet(
+            x,
+            t,
+            encoder_hidden_states=prompt_embeds,
+            added_cond_kwargs=added_cond_kwargs,
+        ).sample
+
+        return pred
+
+    def differentiable_decode(self, z, force_float32: bool = True):
+        # force decoding to be in float32 to avoid overflow
+        vae = self.vae.to(torch.float32) if force_float32 else self.vae
+        z = z.to(torch.float32) if force_float32 else z
+
+        return vae.decode(z / vae.config.scaling_factor).sample
+
+    @torch.no_grad()
+    def decode(self, z, force_float32: bool = True):
+        return self.differentiable_decode(z, force_float32)
+
+    @staticmethod
+    def _get_cond_kwargs(other_prompt_embeds: List[torch.Tensor], use_cfg: bool):
+        pooled_prompt_embeds, negative_pooled_prompt_embeds = other_prompt_embeds
+
+        # additional image-based embeddings
+        add_time_ids = SDWrapper._get_time_ids(pooled_prompt_embeds)
+        negative_add_time_ids = add_time_ids
+
+        add_text_embeds = pooled_prompt_embeds
+        if use_cfg:
+            add_text_embeds = torch.cat(
+                [negative_pooled_prompt_embeds, pooled_prompt_embeds]
+            )
+            add_time_ids = torch.cat([negative_add_time_ids, add_time_ids])
+
+        added_cond_kwargs = {
+            "text_embeds": add_text_embeds,
+            "time_ids": add_time_ids,
+        }
+        return added_cond_kwargs
+
+    @staticmethod
+    def _get_time_ids(prompt_embeds: torch.Tensor):
+        # NOTE these were deduced from pipeline.__call__ of diffuser v0.27.2
+        # and are so far valid for sdxl1.0
+        original_size = (1024, 1024)
+        crops_coords_top_left = (0, 0)
+        target_size = (1024, 1024)
+
+        add_time_ids = list(original_size + crops_coords_top_left + target_size)
+        add_time_ids = torch.tensor(
+            prompt_embeds.shape[0] * [add_time_ids], dtype=prompt_embeds.dtype
+        )
+        return add_time_ids
